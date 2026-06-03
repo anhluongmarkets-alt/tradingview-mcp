@@ -1,5 +1,6 @@
 import { register } from '../router.js';
 import * as core from '../../core/data.js';
+import { verifiedRead } from '../../core/verified_read.js';
 
 register('quote', {
   description: 'Get real-time price quote',
@@ -21,6 +22,30 @@ register('ohlcv', {
 register('values', {
   description: 'Get current indicator values from data window',
   handler: () => core.getStudyValues(),
+});
+
+register('read', {
+  description: 'Verified chart read: set symbol, confirm active chart, read quote/OHLCV, sanity-check, restore',
+  options: {
+    symbol: { type: 'string', description: 'TradingView symbol, e.g. OANDA:XAUUSD or BTCUSD' },
+    timeframe: { type: 'string', description: 'Optional timeframe/resolution, e.g. 240 or D' },
+    quote: { type: 'boolean', description: 'Read quote from the confirmed active chart' },
+    ohlcv: { type: 'boolean', description: 'Read OHLCV bars from the confirmed active chart' },
+    count: { type: 'string', short: 'n', description: 'Number of bars for --ohlcv' },
+    'instrument-key': { type: 'string', description: 'Logical instrument key for plausibility checks, e.g. XAU/USD' },
+    'no-restore': { type: 'boolean', description: 'Do not restore the original chart symbol/timeframe after reading' },
+  },
+  handler: (opts) => {
+    const read = opts.quote ? 'quote' : opts.ohlcv ? 'ohlcv' : null;
+    return verifiedRead({
+      symbol: opts.symbol,
+      timeframe: opts.timeframe,
+      read,
+      count: opts.count ? Number(opts.count) : undefined,
+      instrument_key: opts['instrument-key'],
+      restore: !opts['no-restore'],
+    });
+  },
 });
 
 register('data', {

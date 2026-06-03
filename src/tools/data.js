@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { jsonResult } from './_format.js';
 import * as core from '../core/data.js';
+import { verifiedRead } from '../core/verified_read.js';
 
 export function registerDataTools(server) {
   server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Use summary=true for compact stats instead of all bars (saves context).', {
@@ -8,6 +9,18 @@ export function registerDataTools(server) {
     summary: z.coerce.boolean().optional().describe('Return summary stats (high, low, open, close, avg volume, range) instead of all bars — much smaller output'),
   }, async ({ count, summary }) => {
     try { return jsonResult(await core.getOhlcv({ count, summary })); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('data_read_verified', 'Verified TradingView read: set symbol, confirm active chart symbol, read quote/OHLCV, plausibility-check price magnitude, and restore the original chart state.', {
+    symbol: z.string().describe('Full TradingView symbol, e.g. OANDA:XAUUSD, BITSTAMP:BTCUSD, TVC:DXY'),
+    timeframe: z.string().optional().describe('Optional timeframe/resolution, e.g. 240 or D'),
+    read: z.enum(['quote', 'ohlcv']).describe('Read type'),
+    count: z.coerce.number().optional().describe('Bars to retrieve when read=ohlcv'),
+    instrument_key: z.string().optional().describe('Logical instrument key for plausibility checks, e.g. XAU/USD'),
+    restore: z.coerce.boolean().optional().describe('Restore original chart symbol/timeframe after read; default true'),
+  }, async ({ symbol, timeframe, read, count, instrument_key, restore }) => {
+    try { return jsonResult(await verifiedRead({ symbol, timeframe, read, count, instrument_key, restore: restore !== false })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

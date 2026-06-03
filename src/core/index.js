@@ -4,6 +4,7 @@
  */
 export * as chart from './chart.js';
 export * as data from './data.js';
+export * as verifiedRead from './verified_read.js';
 export * as pine from './pine.js';
 export * as health from './health.js';
 export * as capture from './capture.js';
