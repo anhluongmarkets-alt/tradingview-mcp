@@ -6,6 +6,8 @@ import * as data from './data.js';
 
 const DEFAULT_CONFIRM_ATTEMPTS = 10;
 const DEFAULT_CONFIRM_DELAY_MS = 150;
+const DEFAULT_READ_ATTEMPTS = 3;
+const DEFAULT_READ_RETRY_DELAY_MS = 500;
 const DEFAULT_PRICE_GUARD = '/Users/mb/Projects/STMS-AI-Trading-Desk/scripts/price-plausibility.mjs';
 
 function sleep(ms) {
@@ -47,6 +49,59 @@ function getReadPrice(read, result) {
   const bars = result?.bars || result?.data?.bars || [];
   const last = bars[bars.length - 1];
   return Number(last?.close);
+}
+
+async function readWithPlausibility({
+  symbol,
+  timeframe,
+  read,
+  count,
+  priceKey,
+  isMeaningfulPrice,
+  confirmAttempts,
+  confirmDelayMs,
+  deps,
+}) {
+  let lastResult = null;
+  let lastPrice = NaN;
+
+  for (let attempt = 1; attempt <= DEFAULT_READ_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      const setResult = await (deps?.setSymbol || chart.setSymbol)({ symbol });
+      if (setResult?.success === false) throw new Error(setResult.error || 'symbol set returned success:false');
+      if (timeframe) {
+        const tfResult = await (deps?.setTimeframe || chart.setTimeframe)({ timeframe });
+        if (tfResult?.success === false) throw new Error(tfResult.error || 'timeframe set returned success:false');
+      }
+      const confirmed = await confirmSymbol({
+        symbol,
+        attempts: confirmAttempts,
+        delayMs: confirmDelayMs,
+        deps,
+      });
+      if (!confirmed.matched) {
+        throw new Error(`active symbol ${confirmed.state?.symbol || 'unknown'} did not match ${symbol}`);
+      }
+      await sleep(DEFAULT_READ_RETRY_DELAY_MS);
+    }
+
+    const result = read === 'quote'
+      ? await (deps?.getQuote || data.getQuote)({})
+      : await (deps?.getOhlcv || data.getOhlcv)({ count: Number(count), summary: false });
+    const price = getReadPrice(read, result);
+    lastResult = result;
+    lastPrice = price;
+
+    if (Number.isFinite(price) && isMeaningfulPrice(priceKey, price)) {
+      return { result, price, attempts: attempt };
+    }
+
+    if (attempt < DEFAULT_READ_ATTEMPTS) {
+      await sleep(DEFAULT_READ_RETRY_DELAY_MS);
+    }
+  }
+
+  return { result: lastResult, price: lastPrice, attempts: DEFAULT_READ_ATTEMPTS };
 }
 
 async function restoreChart(original, deps) {
@@ -144,10 +199,23 @@ export async function verifiedRead({
       return response;
     }
 
+    let readAttempts = 0;
+    const isMeaningfulPrice = await loadMeaningfulPriceChecker(_deps);
+    const priceKey = instrument_key || symbol;
     try {
-      result = read === 'quote'
-        ? await (_deps?.getQuote || data.getQuote)({})
-        : await (_deps?.getOhlcv || data.getOhlcv)({ count: Number(count), summary: false });
+      const readResult = await readWithPlausibility({
+        symbol,
+        timeframe,
+        read,
+        count,
+        priceKey,
+        isMeaningfulPrice,
+        confirmAttempts: Number(confirm_attempts) || DEFAULT_CONFIRM_ATTEMPTS,
+        confirmDelayMs: Number(confirm_delay_ms) || DEFAULT_CONFIRM_DELAY_MS,
+        deps: _deps,
+      });
+      result = readResult.result;
+      readAttempts = readResult.attempts;
     } catch (err) {
       response = {
         success: false,
@@ -162,8 +230,6 @@ export async function verifiedRead({
     }
 
     const price = getReadPrice(read, result);
-    const isMeaningfulPrice = await loadMeaningfulPriceChecker(_deps);
-    const priceKey = instrument_key || symbol;
     if (!Number.isFinite(price) || !isMeaningfulPrice(priceKey, price)) {
       response = {
         success: false,
@@ -172,6 +238,7 @@ export async function verifiedRead({
         symbol,
         confirmed_symbol: confirmed.state?.symbol || '',
         confirm_attempts: confirmed.attempts,
+        read_attempts: readAttempts,
         restored: false,
       };
       return response;
@@ -185,6 +252,7 @@ export async function verifiedRead({
       read,
       data: read === 'quote' ? result : { bars: result.bars || [] },
       confirm_attempts: confirmed.attempts,
+      read_attempts: readAttempts,
       restored: false,
     };
     return response;

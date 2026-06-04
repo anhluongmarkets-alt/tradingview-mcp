@@ -6,11 +6,13 @@ function deps({
   states,
   quote,
   ohlcv,
+  ohlcvQueue,
   quoteError,
   meaningful = true,
 } = {}) {
   const calls = [];
   const stateQueue = [...states];
+  const ohlcvResults = [...(ohlcvQueue || [])];
   return {
     calls,
     getState: async () => {
@@ -32,9 +34,10 @@ function deps({
     },
     getOhlcv: async ({ count }) => {
       calls.push(['getOhlcv', count]);
+      if (ohlcvResults.length > 0) return ohlcvResults.shift();
       return ohlcv || { success: true, bars: [{ time: 1, open: 4480, high: 4490, low: 4470, close: 4485 }] };
     },
-    isMeaningfulPrice: () => meaningful,
+    isMeaningfulPrice: (...args) => typeof meaningful === 'function' ? meaningful(...args) : meaningful,
   };
 }
 
@@ -92,6 +95,8 @@ describe('verifiedRead', () => {
       states: [
         { symbol: 'OANDA:EURGBP', resolution: '240' },
         { symbol: 'OANDA:XAUUSD', resolution: '240' },
+        { symbol: 'OANDA:XAUUSD', resolution: '240' },
+        { symbol: 'OANDA:XAUUSD', resolution: '240' },
       ],
       quote: { success: true, symbol: 'OANDA:XAUUSD', last: 0.86 },
       meaningful: false,
@@ -107,6 +112,34 @@ describe('verifiedRead', () => {
     assert.equal(result.success, false);
     assert.equal(result.error, 'magnitude_mismatch');
     assert.equal(result.restored, true);
+  });
+
+  it('retries OHLCV reads when chart bars lag behind confirmed symbol', async () => {
+    const fake = deps({
+      states: [
+        { symbol: 'OANDA:AUDUSD', resolution: '240' },
+        { symbol: 'OANDA:EURGBP', resolution: '240' },
+      ],
+      ohlcvQueue: [
+        { success: true, bars: [{ time: 1, open: 0.713, high: 0.714, low: 0.712, close: 0.713 }] },
+        { success: true, bars: [{ time: 2, open: 0.864, high: 0.865, low: 0.863, close: 0.8647 }] },
+      ],
+      meaningful: (_key, price) => price > 0.8 && price < 0.9,
+    });
+
+    const result = await verifiedRead({
+      symbol: 'OANDA:EURGBP',
+      timeframe: '240',
+      read: 'ohlcv',
+      count: 180,
+      instrument_key: 'EUR/GBP',
+      _deps: fake,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.read_attempts, 2);
+    assert.equal(result.data.bars.at(-1).close, 0.8647);
+    assert.equal(fake.calls.filter(c => c[0] === 'getOhlcv').length, 2);
   });
 
   it('restore-on-error restores original chart state after read failure', async () => {
