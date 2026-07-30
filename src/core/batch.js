@@ -1,7 +1,8 @@
 /**
  * Core batch execution logic.
  */
-import { evaluate, evaluateAsync, getClient, getChartApi, getChartCollection, safeString } from '../connection.js';
+import { evaluate, getClient, getChartApi, getChartCollection, safeString } from '../connection.js';
+import { getOhlcv } from './data.js';
 import { waitForChartReady } from '../wait.js';
 import { writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
@@ -9,6 +10,20 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCREENSHOT_DIR = join(dirname(dirname(__dirname)), 'screenshots');
+
+function normalizeSymbol(symbol) {
+  return String(symbol || '')
+    .split(':')
+    .pop()
+    .replace(/[^A-Za-z0-9]/g, '')
+    .toUpperCase();
+}
+
+function symbolsMatch(actual, expected) {
+  const left = normalizeSymbol(actual);
+  const right = normalizeSymbol(expected);
+  return Boolean(left && right && (left === right || left.endsWith(right) || right.endsWith(left)));
+}
 
 export async function batchRun({ symbols, timeframes, action, delay_ms, ohlcv_count }) {
   const tfs = timeframes && timeframes.length > 0 ? timeframes : [null];
@@ -32,6 +47,10 @@ export async function batchRun({ symbols, timeframes, action, delay_ms, ohlcv_co
         }
 
         await waitForChartReady(symbol);
+        const activeSymbol = apiPath ? await evaluate(`${apiPath}.symbol()`) : null;
+        if (!symbolsMatch(activeSymbol, symbol)) {
+          throw new Error(`symbol_confirm_failed: requested ${symbol}, active ${activeSymbol || 'unknown'}`);
+        }
         await new Promise(r => setTimeout(r, delay));
 
         let actionResult;
@@ -44,17 +63,12 @@ export async function batchRun({ symbols, timeframes, action, delay_ms, ohlcv_co
           const filePath = join(SCREENSHOT_DIR, fname);
           writeFileSync(filePath, Buffer.from(data, 'base64'));
           actionResult = { file_path: filePath };
-        } else if (action === 'get_ohlcv' && apiPath) {
-          const limit = Math.min(ohlcv_count || 100, 500);
-          actionResult = await evaluateAsync(`
-            new Promise(function(resolve, reject) {
-              ${apiPath}.exportData({ includeTime: true, includeSeries: true, includeStudies: false })
-                .then(function(result) {
-                  var bars = (result.data || []).slice(-${limit});
-                  resolve({ bar_count: bars.length, last_bar: bars[bars.length - 1] || null });
-                }).catch(reject);
-            })
-          `);
+        } else if (action === 'get_ohlcv') {
+          const ohlcv = await getOhlcv({ count: ohlcv_count });
+          actionResult = {
+            bar_count: ohlcv.bar_count,
+            last_bar: ohlcv.bars[ohlcv.bars.length - 1] || null,
+          };
         } else if (action === 'get_strategy_results') {
           await new Promise(r => setTimeout(r, 1000));
           actionResult = await evaluate(`

@@ -22,6 +22,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import CDP from 'chrome-remote-interface';
+import { batchRun } from '../src/core/batch.js';
 
 let client;
 let Runtime;
@@ -1376,19 +1377,60 @@ val = array.get(a, 5)`;
   // ─── 11. BATCH (1 tool) ───────────────────────────────────────────────
 
   describe('Batch', () => {
+    let originalSymbol;
+    let originalTF;
 
-    it('batch_run — verify symbol/tf switching mechanism', async () => {
-      // batch_run iterates symbols + timeframes, sets each, then runs an action.
-      // We test the underlying switching mechanism without running a full batch.
-      const original = await evaluate(`${CHART_API}.symbol()`);
-      assert.ok(original, 'Can read current symbol for batch switching');
+    before(async () => {
+      originalSymbol = await evaluate(`${CHART_API}.symbol()`);
+      originalTF = await evaluate(`${CHART_API}.resolution()`);
+    });
 
-      // Verify setSymbol exists
-      const hasSetSymbol = await evaluate(`typeof ${CHART_API}.setSymbol === 'function'`);
-      assert.ok(hasSetSymbol, 'setSymbol available for batch operations');
+    after(async () => {
+      await evaluate(`${CHART_API}.setSymbol('${originalSymbol}')`);
+      await sleep(2000);
+      await evaluate(`${CHART_API}.setResolution('${originalTF}')`);
+      await sleep(1000);
+    });
 
-      const hasSetResolution = await evaluate(`typeof ${CHART_API}.setResolution === 'function'`);
-      assert.ok(hasSetResolution, 'setResolution available for batch operations');
+    it('batch_run get_ohlcv — returns confirmed bars for two distinct symbols', async () => {
+      const result = await batchRun({
+        symbols: ['OANDA:EURUSD', 'OANDA:XAUUSD'],
+        timeframes: ['240'],
+        action: 'get_ohlcv',
+        delay_ms: 250,
+        ohlcv_count: 3,
+      });
+
+      assert.equal(result.successful, 2);
+      assert.equal(result.failed, 0);
+      for (const iteration of result.results) {
+        assert.equal(iteration.success, true);
+        assert.ok(iteration.result.bar_count > 0);
+        assert.ok(iteration.result.last_bar);
+      }
+
+      const eurusdClose = result.results[0].result.last_bar.close;
+      const goldClose = result.results[1].result.last_bar.close;
+      assert.notEqual(eurusdClose, goldClose, 'Each iteration returned distinct symbol data');
+      assert.ok(eurusdClose > 0.5 && eurusdClose < 2, `EURUSD close is plausible: ${eurusdClose}`);
+      assert.ok(goldClose > 1000, `XAUUSD close is plausible: ${goldClose}`);
+    });
+
+    it('batch_run get_ohlcv — symbol mismatch fails closed without bars', async () => {
+      const result = await batchRun({
+        symbols: ['OANDA:EURUSD', 'INVALID:CODEX_DOES_NOT_EXIST'],
+        timeframes: ['240'],
+        action: 'get_ohlcv',
+        delay_ms: 250,
+        ohlcv_count: 3,
+      });
+
+      assert.equal(result.successful, 1);
+      assert.equal(result.failed, 1);
+      const failed = result.results[1];
+      assert.equal(failed.success, false);
+      assert.match(failed.error, /^symbol_confirm_failed: requested INVALID:CODEX_DOES_NOT_EXIST, active /);
+      assert.equal('result' in failed, false, 'Failed iteration returns no result or bars');
     });
   });
 
