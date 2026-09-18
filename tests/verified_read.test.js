@@ -27,9 +27,12 @@ function deps({
       calls.push(['setTimeframe', timeframe]);
       return { success: true, timeframe };
     },
+    sleep: async (ms) => {
+      calls.push(['sleep', ms]);
+    },
     getQuote: async () => {
       calls.push(['getQuote']);
-      if (quoteError) throw new Error(quoteError);
+      if (quoteError) throw quoteError instanceof Error ? quoteError : new Error(quoteError);
       return quote || { success: true, symbol: 'OANDA:XAUUSD', last: 4485 };
     },
     getOhlcv: async ({ count }) => {
@@ -142,6 +145,64 @@ describe('verifiedRead', () => {
     assert.equal(fake.calls.filter(c => c[0] === 'getOhlcv').length, 2);
   });
 
+  it('waits for a freshly launched chart whose data feed returns no bars yet', async () => {
+    const fake = deps({
+      states: [
+        { symbol: 'OANDA:AUDJPY', resolution: '240' },
+        { symbol: 'OANDA:EURUSD', resolution: '240' },
+        { symbol: 'OANDA:EURUSD', resolution: '240' },
+      ],
+      ohlcvQueue: [
+        { success: true, bars: [] },
+        { success: true, bars: [] },
+        { success: true, bars: [] },
+        { success: true, bars: [] },
+        { success: true, bars: [{ time: 5, open: 1.146, high: 1.147, low: 1.145, close: 1.1461 }] },
+      ],
+      meaningful: (_key, price) => price > 1 && price < 1.3,
+    });
+    fake.emptyReadDelayMs = 1;
+
+    const result = await verifiedRead({
+      symbol: 'OANDA:EURUSD',
+      timeframe: '240',
+      read: 'ohlcv',
+      count: 180,
+      instrument_key: 'EUR/USD',
+      _deps: fake,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.read_attempts, 5, 'empty reads extend the bounded retry budget past the default 3');
+    assert.equal(result.data.bars.at(-1).close, 1.1461);
+    assert.equal(fake.calls.filter(c => c[0] === 'setSymbol' && c[1] === 'OANDA:EURUSD').length, 1, 'symbol is not re-set while bars are merely loading');
+  });
+
+  it('still fails closed when the data feed never delivers bars', async () => {
+    const fake = deps({
+      states: [
+        { symbol: 'OANDA:AUDJPY', resolution: '240' },
+        { symbol: 'OANDA:EURUSD', resolution: '240' },
+        { symbol: 'OANDA:EURUSD', resolution: '240' },
+      ],
+      ohlcvQueue: Array.from({ length: 12 }, () => ({ success: true, bars: [] })),
+      meaningful: () => true,
+    });
+    fake.emptyReadDelayMs = 1;
+
+    const result = await verifiedRead({
+      symbol: 'OANDA:EURUSD',
+      timeframe: '240',
+      read: 'ohlcv',
+      count: 180,
+      instrument_key: 'EUR/USD',
+      _deps: fake,
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(fake.calls.filter(c => c[0] === 'getOhlcv').length, 8, 'bounded at DEFAULT_EMPTY_READ_ATTEMPTS');
+  });
+
   it('restore-on-error restores original chart state after read failure', async () => {
     const fake = deps({
       states: [
@@ -161,5 +222,76 @@ describe('verifiedRead', () => {
     assert.equal(result.error, 'read_failed');
     assert.equal(result.restored, true);
     assert.deepEqual(result.restored_to, { symbol: 'OANDA:EURGBP', timeframe: '240' });
+  });
+
+  it('classifies a stalled renderer separately and reports the failed read attempt', async () => {
+    const stalled = new Error('Runtime.evaluate timed out after 15ms');
+    stalled.code = 'renderer_unresponsive';
+    const fake = deps({
+      states: [
+        { symbol: 'OANDA:EURGBP', resolution: '240' },
+        { symbol: 'OANDA:XAUUSD', resolution: '240' },
+      ],
+      quoteError: stalled,
+    });
+
+    const result = await verifiedRead({
+      symbol: 'OANDA:XAUUSD',
+      read: 'quote',
+      _deps: fake,
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'renderer_unresponsive');
+    assert.equal(result.confirm_attempts, 1);
+    assert.equal(result.read_attempts, 1);
+  });
+
+  it('reissues a silently ignored symbol set and succeeds within the confirm budget', async () => {
+    const fake = deps({
+      states: [
+        { symbol: 'OANDA:AUDJPY', resolution: '240' },
+        { symbol: 'OANDA:AUDJPY', resolution: '240' },
+        { symbol: 'OANDA:EURUSD', resolution: '240' },
+      ],
+      quote: { success: true, symbol: 'OANDA:EURUSD', last: 1.18 },
+    });
+
+    const result = await verifiedRead({
+      symbol: 'OANDA:EURUSD',
+      timeframe: '240',
+      read: 'quote',
+      confirm_attempts: 2,
+      _deps: fake,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.confirm_attempts, 2);
+    assert.equal(fake.calls.filter(call => call[0] === 'setSymbol' && call[1] === 'OANDA:EURUSD').length, 2);
+    assert.ok(fake.calls.some(call => call[0] === 'sleep' && call[1] === 1000));
+  });
+
+  it('fails with the same bounded mismatch shape when the symbol retry is ignored', async () => {
+    const fake = deps({
+      states: [
+        { symbol: 'OANDA:AUDJPY', resolution: '240' },
+        { symbol: 'OANDA:AUDJPY', resolution: '240' },
+        { symbol: 'OANDA:AUDJPY', resolution: '240' },
+      ],
+    });
+
+    const result = await verifiedRead({
+      symbol: 'OANDA:EURUSD',
+      timeframe: '240',
+      read: 'quote',
+      confirm_attempts: 2,
+      _deps: fake,
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'symbol_confirm_timeout');
+    assert.equal(result.message, 'active symbol OANDA:AUDJPY did not match OANDA:EURUSD');
+    assert.equal(result.confirm_attempts, 2);
+    assert.equal(fake.calls.some(call => call[0] === 'getQuote'), false);
   });
 });

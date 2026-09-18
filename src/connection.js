@@ -6,6 +6,60 @@ const CDP_HOST = 'localhost';
 const CDP_PORT = 9222;
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
+const DEFAULT_CDP_TIMEOUT_MS = 15000;
+
+export class ConnectionError extends Error {
+  constructor(code, message, options = {}) {
+    super(message, options);
+    this.name = 'ConnectionError';
+    this.code = code;
+  }
+}
+
+export function getCdpTimeoutMs() {
+  const configured = Number(process.env.TV_CDP_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_CDP_TIMEOUT_MS;
+}
+
+function closeClient(candidate) {
+  if (!candidate || typeof candidate.close !== 'function') return;
+  try {
+    Promise.resolve(candidate.close()).catch(() => {});
+  } catch { /* already closed */ }
+  if (client === candidate) {
+    client = null;
+    targetInfo = null;
+  }
+}
+
+/** Run one CDP operation with a hard deadline and close its socket on timeout. */
+export async function cdpCall(candidate, operationName, operation, timeoutMs = getCdpTimeoutMs()) {
+  let timer;
+  const pending = Promise.resolve().then(operation);
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      closeClient(candidate);
+      reject(new ConnectionError(
+        'renderer_unresponsive',
+        `${operationName} timed out after ${timeoutMs}ms`,
+      ));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([pending, timeout]);
+  } finally {
+    clearTimeout(timer);
+    // Prevent a late rejection from an operation which lost the timeout race.
+    pending.catch(() => {});
+  }
+}
+
+function disconnected(message, cause) {
+  return new ConnectionError('mcp_disconnected', message, cause ? { cause } : {});
+}
 
 // Known direct API paths discovered via live probing (see PROBE_RESULTS.md)
 const KNOWN_PATHS = {
@@ -47,53 +101,88 @@ export function requireFinite(value, name) {
   return n;
 }
 
-export async function getClient() {
-  if (client) {
-    try {
-      // Quick liveness check
-      await client.Runtime.evaluate({ expression: '1', returnByValue: true });
-      return client;
-    } catch {
-      client = null;
-      targetInfo = null;
-    }
-  }
-  return connect();
+export function isChartTarget(target) {
+  return Boolean(target?.type === 'page' && /tradingview\.com\/chart/i.test(target.url || ''));
 }
 
-export async function connect() {
+export async function getClient(_deps = {}) {
+  if (client) {
+    if (!isChartTarget(targetInfo)) {
+      // Electron's splash renderer remains CDP-responsive after the real chart
+      // target appears. Never let that liveness keep a non-chart target cached.
+      closeClient(client);
+      return connect(_deps);
+    }
+    try {
+      // Quick liveness check
+      await cdpCall(client, 'Runtime.evaluate', () => client.Runtime.evaluate({ expression: '1', returnByValue: true }));
+      return client;
+    } catch (err) {
+      closeClient(client);
+      client = null;
+      targetInfo = null;
+      if (err?.code === 'renderer_unresponsive') throw err;
+    }
+  }
+  return connect(_deps);
+}
+
+export async function connect(_deps = {}) {
+  const cdpFactory = _deps.cdp || CDP;
+  const wait = _deps.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const target = await findChartTarget();
+      const target = await findChartTarget(_deps);
       if (!target) {
         throw new Error('No TradingView chart target found. Is TradingView open with a chart?');
       }
       targetInfo = target;
-      client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
+      let connectedClient;
+      const connectPromise = cdpFactory({ host: CDP_HOST, port: CDP_PORT, target: target.id });
+      // If connection establishment itself times out, close a socket that resolves late.
+      connectPromise.then(value => {
+        connectedClient = value;
+      }).catch(() => {});
+      try {
+        client = await cdpCall(null, 'CDP target connect', () => connectPromise);
+      } catch (err) {
+        connectPromise.then(closeClient).catch(() => {});
+        closeClient(connectedClient);
+        throw err;
+      }
 
       // Enable required domains
-      await client.Runtime.enable();
-      await client.Page.enable();
-      await client.DOM.enable();
+      await cdpCall(client, 'Runtime.enable', () => client.Runtime.enable());
+      await cdpCall(client, 'Page.enable', () => client.Page.enable());
+      await cdpCall(client, 'DOM.enable', () => client.DOM.enable());
 
       return client;
     } catch (err) {
       lastError = err;
+      closeClient(client);
+      targetInfo = null;
+      if (err?.code === 'renderer_unresponsive') throw err;
       const delay = Math.min(BASE_DELAY * Math.pow(2, attempt), 30000);
-      await new Promise(r => setTimeout(r, delay));
+      if (attempt < MAX_RETRIES - 1) await wait(delay);
     }
   }
-  throw new Error(`CDP connection failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
+  throw disconnected(`CDP connection failed after ${MAX_RETRIES} attempts: ${lastError?.message}`, lastError);
 }
 
-async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
-  // Prefer targets with tradingview.com/chart in the URL
-  return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
-    || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
-    || null;
+export async function findChartTarget(_deps = {}) {
+  const fetchImpl = _deps.fetch || fetch;
+  let resp;
+  try {
+    resp = await cdpCall(null, 'CDP target listing', () => fetchImpl(`http://${CDP_HOST}:${CDP_PORT}/json/list`));
+  } catch (err) {
+    if (err?.code === 'renderer_unresponsive') throw err;
+    throw disconnected(`CDP target listing failed: ${err?.message || err}`, err);
+  }
+  if (!resp.ok) throw disconnected(`CDP target listing failed: HTTP ${resp.status}`);
+  const targets = await cdpCall(null, 'CDP target listing response', () => resp.json());
+  // Splash/file:// renderers are live CDP pages but cannot serve chart APIs.
+  return targets.find(isChartTarget) || null;
 }
 
 export async function getTargetInfo() {
@@ -105,12 +194,13 @@ export async function getTargetInfo() {
 
 export async function evaluate(expression, opts = {}) {
   const c = await getClient();
-  const result = await c.Runtime.evaluate({
+  const { timeoutMs, ...evaluateOpts } = opts;
+  const result = await cdpCall(c, 'Runtime.evaluate', () => c.Runtime.evaluate({
     expression,
     returnByValue: true,
-    awaitPromise: opts.awaitPromise ?? false,
-    ...opts,
-  });
+    awaitPromise: evaluateOpts.awaitPromise ?? false,
+    ...evaluateOpts,
+  }), timeoutMs ?? getCdpTimeoutMs());
   if (result.exceptionDetails) {
     const msg = result.exceptionDetails.exception?.description
       || result.exceptionDetails.text

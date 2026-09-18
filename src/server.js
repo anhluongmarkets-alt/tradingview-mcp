@@ -57,7 +57,7 @@ Replay: replay_start → replay_step → replay_trade → replay_status → repl
 Batch: batch_run → run action across multiple symbols/timeframes
 Drawing: draw_shape → horizontal_line, trend_line, rectangle, text
 Alerts: alert_create, alert_list, alert_delete
-Launch: tv_launch → auto-detect and start TradingView with CDP on any platform
+Launch/recovery: tv_ensure → health-check and relaunch only if needed; tv_launch → force a launch
 Panes: pane_list, pane_set_layout (s, 2h, 2v, 4, 6, 8), pane_focus, pane_set_symbol
 Tabs: tab_list, tab_new, tab_close, tab_switch
 

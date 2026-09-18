@@ -67,6 +67,7 @@ Gives your AI assistant eyes and hands on your own chart:
 - **Monitor your chart** — stream JSONL from your locally running chart for local monitoring scripts
 - **CLI access** — every MCP tool is also a `tv` CLI command, pipe-friendly with JSON output
 - **Launch TradingView** — auto-detect and launch with debug mode from any platform
+- **Recover TradingView** — detect a stopped or stalled renderer and relaunch only when needed
 
 ## Install with Claude Code
 
@@ -150,6 +151,8 @@ node src/cli/index.js <command>
 
 ```bash
 tv status                          # check connection
+tv ensure --timeout 30             # recover a stopped/stalled renderer if needed
+tv ensure --timeout 30 --no-kill   # launch without killing the existing main process
 tv quote                           # current price
 tv symbol AAPL                     # change symbol
 tv ohlcv --summary                 # price summary
@@ -163,7 +166,7 @@ tv stream quote | jq '.close'      # monitor price changes
 ### All Commands
 
 ```
-tv status / launch / state / symbol / timeframe / type / info / search
+tv status / ensure / launch / state / symbol / timeframe / type / info / search
 tv quote / ohlcv / values
 tv data lines/labels/tables/boxes/strategy/trades/equity/depth/indicator
 tv pine get/set/compile/analyze/check/save/new/open/list/errors/console
@@ -179,6 +182,20 @@ tv stream quote/bars/values/lines/labels/tables/all
 tv ui click/keyboard/hover/scroll/find/eval/type/panel/fullscreen/mouse
 tv screenshot / discover / ui-state / range / scroll
 ```
+
+CDP operations have a hard 15-second deadline by default. Override it with
+`TV_CDP_TIMEOUT_MS` (milliseconds), for example `TV_CDP_TIMEOUT_MS=5000 tv status`.
+`tv ensure` reports `healthy` / `relaunched` only when the chart proves it is
+**processing work**, not merely answering `Runtime.evaluate`: no loading screen
+or symbol resolution in flight, the widget's `dataReady` and `whenChartReady`
+callbacks fire, the callback form of `setSymbol(currentSymbol, cb)` fires (a
+no-op or hung `setSymbol` never calls back), and the main series has bars. After
+a relaunch this probe must pass twice about one second apart. A widget whose
+`setSymbol` was replaced by a no-op is classified `renderer_unresponsive` and
+relaunched (verified live 2026-09-17). Electron `file://` splash targets are
+ignored; readiness requires a `tradingview.com/chart` page target.
+On macOS, relaunch kills only the exact `TradingView` main executable; it does
+not use a broad command-line match that could also terminate the ShipIt updater.
 
 ## Streaming
 

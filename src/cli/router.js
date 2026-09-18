@@ -140,11 +140,15 @@ async function execute(handler, values, positionals) {
 
 function handleError(err) {
   const message = err.message || String(err);
+  const payload = err.code ? { success: false, error: err.code, message } : { success: false, error: message };
+  for (const field of ['action', 'reason', 'pid', 'elapsed_ms']) {
+    if (err[field] !== undefined) payload[field] = err[field];
+  }
   // Connection failures get exit code 2
-  if (/CDP|connection|ECONNREFUSED|not running/i.test(message)) {
-    console.error(JSON.stringify({ success: false, error: message }, null, 2));
+  if (err.code === 'renderer_unresponsive' || err.code === 'mcp_disconnected' || /CDP|connection|ECONNREFUSED|not running/i.test(message)) {
+    console.error(JSON.stringify(payload, null, 2));
     process.exit(2);
   }
-  console.error(JSON.stringify({ success: false, error: message }, null, 2));
+  console.error(JSON.stringify(payload, null, 2));
   process.exit(1);
 }

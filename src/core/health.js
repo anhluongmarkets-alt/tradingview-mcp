@@ -1,15 +1,44 @@
 /**
  * Core health/discovery/launch logic.
  */
-import { getClient, getTargetInfo, evaluate } from '../connection.js';
+import { getClient, getTargetInfo, evaluate, disconnect, isChartTarget, getCdpTimeoutMs, KNOWN_PATHS } from '../connection.js';
 import { existsSync } from 'fs';
+import * as data from './data.js';
 import { execSync, spawn } from 'child_process';
 
-export async function healthCheck() {
-  await getClient();
-  const target = await getTargetInfo();
+function classifyConnectionError(err) {
+  if (err?.code === 'renderer_unresponsive') return 'renderer_unresponsive';
+  if (err?.code === 'mcp_disconnected') return 'mcp_disconnected';
+  const message = err?.message || String(err || '');
+  if (/CDP|connection|ECONNREFUSED|fetch failed|not running|disconnected/i.test(message)) return 'mcp_disconnected';
+  return 'health_check_failed';
+}
 
-  const state = await evaluate(`
+export async function healthCheck({ _deps } = {}) {
+  const acquireClient = _deps?.getClient || getClient;
+  const acquireTarget = _deps?.getTargetInfo || getTargetInfo;
+  const runEvaluate = _deps?.evaluate || evaluate;
+  try {
+    await acquireClient();
+    const target = await acquireTarget();
+    const targetIsChart = isChartTarget(target);
+
+    if (!targetIsChart) {
+      return {
+        success: true,
+        cdp_connected: true,
+        target_id: target?.id,
+        target_url: target?.url,
+        target_title: target?.title,
+        target_is_chart: false,
+        chart_symbol: 'unknown',
+        chart_resolution: 'unknown',
+        chart_type: null,
+        api_available: false,
+      };
+    }
+
+    const state = await runEvaluate(`
     (function() {
       var result = { url: window.location.href, title: document.title };
       try {
@@ -29,17 +58,234 @@ export async function healthCheck() {
     })()
   `);
 
-  return {
-    success: true,
-    cdp_connected: true,
-    target_id: target.id,
-    target_url: target.url,
-    target_title: target.title,
-    chart_symbol: state?.symbol || 'unknown',
-    chart_resolution: state?.resolution || 'unknown',
-    chart_type: state?.chartType ?? null,
-    api_available: state?.apiAvailable ?? false,
+    return {
+      success: true,
+      cdp_connected: true,
+      target_id: target.id,
+      target_url: target.url,
+      target_title: target.title,
+      target_is_chart: true,
+      chart_symbol: state?.symbol || 'unknown',
+      chart_resolution: state?.resolution || 'unknown',
+      chart_type: state?.chartType ?? null,
+      api_available: state?.apiAvailable ?? false,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: classifyConnectionError(err),
+      message: err?.message || String(err),
+      cdp_connected: err?.code === 'renderer_unresponsive',
+    };
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function chartRoundTrip(timeoutMs) {
+  // A same-symbol `setSymbol` + `symbol()` compare proves nothing: an ignored
+  // (no-op) or hung `setSymbol` leaves `symbol()` unchanged, so it would read as
+  // "ready". Readiness is therefore evidence the chart is *processing work*:
+  //   1. no loading screen / symbol resolution in flight,
+  //   2. the widget's own `dataReady` and `whenChartReady` callbacks FIRE,
+  //   3. `setSymbol(same, cb)` — the callback form — FIRES (a no-op never calls it),
+  //   4. the main series has bars.
+  // Everything must complete inside the page within `budgetMs`; a hung renderer
+  // never resolves the promise and trips the CDP deadline (`renderer_unresponsive`).
+  const budgetMs = Math.max(500, Math.min(Number(timeoutMs) || 5000, 10000) - 200);
+  return evaluate(`
+    (function() {
+      var chart = window.TradingViewApi._activeChartWidgetWV.value();
+      var symbol = chart && typeof chart.symbol === 'function' ? chart.symbol() : '';
+      var pending = { dataReady: true, whenChartReady: true, setSymbolCallback: true, bars: true };
+      var result = { ready: false, symbol: symbol || '', pending: [] };
+      if (!symbol || typeof chart.setSymbol !== 'function') {
+        result.pending = ['no_symbol'];
+        return result;
+      }
+      function busy() {
+        try { if (typeof chart.loadingScreenActive === 'function' && chart.loadingScreenActive()) return 'loading_screen'; } catch (e) {}
+        try { if (typeof chart.symbolResolvingActive === 'function' && chart.symbolResolvingActive()) return 'symbol_resolving'; } catch (e) {}
+        return null;
+      }
+      function barsPresent() {
+        try {
+          var bars = ${KNOWN_PATHS.mainSeriesBars};
+          return !!bars && typeof bars.size === 'function' && bars.size() > 0;
+        } catch (e) { return false; }
+      }
+      return new Promise(function(resolve) {
+        var settled = false;
+        function check() {
+          if (settled) return;
+          if (!pending.dataReady && !pending.whenChartReady && !pending.setSymbolCallback && barsPresent() && !busy()) {
+            pending.bars = false;
+            settled = true;
+            resolve({ ready: true, symbol: chart.symbol() || symbol, pending: [] });
+          }
+        }
+        try { chart.dataReady(function() { pending.dataReady = false; check(); }); } catch (e) { pending.dataReady = 'error:' + e.message; }
+        try { chart.whenChartReady(function() { pending.whenChartReady = false; check(); }); } catch (e) { pending.whenChartReady = 'error:' + e.message; }
+        try { chart.setSymbol(symbol, function() { pending.setSymbolCallback = false; check(); }); } catch (e) { pending.setSymbolCallback = 'error:' + e.message; }
+        var poll = setInterval(function() { if (settled) { clearInterval(poll); return; } check(); }, 100);
+        setTimeout(function() {
+          if (settled) return;
+          settled = true;
+          clearInterval(poll);
+          var open = [];
+          for (var k in pending) { if (pending[k]) open.push(k + (typeof pending[k] === 'string' ? '(' + pending[k] + ')' : '')); }
+          var b = busy(); if (b) open.push(b);
+          resolve({ ready: false, symbol: chart.symbol() || symbol, pending: open });
+        }, ${budgetMs});
+      });
+    })()
+  `, { awaitPromise: true, timeoutMs });
+}
+
+async function hasBars(timeoutMs) {
+  try {
+    const result = await data.getOhlcv({ count: 1, summary: false, timeoutMs });
+    const bars = result?.bars || result?.data?.bars || [];
+    return Array.isArray(bars) && bars.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function hasChartTarget(status) {
+  if (typeof status?.target_is_chart === 'boolean') return status.target_is_chart;
+  if (status?.target_url) return /tradingview\.com\/chart/i.test(status.target_url);
+  return true;
+}
+
+function mainProcessPid() {
+  try {
+    const name = process.platform === 'win32' ? 'TradingView.exe' : 'TradingView';
+    const cmd = process.platform === 'win32'
+      ? `tasklist /FI "IMAGENAME eq ${name}" /FO CSV /NH`
+      : `pgrep -x ${name}`;
+    const output = execSync(cmd, { timeout: 3000 }).toString().trim();
+    if (process.platform === 'win32') {
+      const match = output.match(/"TradingView\.exe","(\d+)"/i);
+      return match ? Number(match[1]) : null;
+    }
+    const pid = Number(output.split('\n')[0]);
+    return Number.isFinite(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Ensure a responsive chart renderer, relaunching TradingView only when required. */
+export async function ensure({ timeout = 30, no_kill = false, _deps } = {}) {
+  const startedAt = (_deps?.now || Date.now)();
+  const timeoutMs = Math.max(1, Number(timeout) || 30) * 1000;
+  const deadline = startedAt + timeoutMs;
+  const check = _deps?.healthCheck || healthCheck;
+  const doLaunch = _deps?.launch || launch;
+  const wait = _deps?.sleep || sleep;
+  const now = _deps?.now || Date.now;
+  const getPid = _deps?.getPid || mainProcessPid;
+  const probeChart = _deps?.chartRoundTrip || chartRoundTrip;
+  const resetConnection = _deps?.disconnect || disconnect;
+
+  // A quick `Runtime.evaluate` answering is not proof the chart can do work: a
+  // partially stalled renderer (the 2026-09-17 10:20 shape) still answers the
+  // health probe while `setSymbol` never takes. "Healthy" therefore requires the
+  // same chart write/read round-trip the post-launch gate uses.
+  let partialStall = null;
+  const chartWorks = async () => {
+    const remainingMs = Math.max(1, deadline - now());
+    try {
+      const probe = await probeChart(Math.min(remainingMs, getCdpTimeoutMs()));
+      if (probe?.ready && probe.symbol) return true;
+      partialStall = 'renderer_unresponsive';
+    } catch (err) {
+      partialStall = err?.code === 'mcp_disconnected' ? 'mcp_disconnected' : 'renderer_unresponsive';
+    }
+    return false;
   };
+
+  let status = await check();
+  if (status.success && status.api_available && hasChartTarget(status) && await chartWorks()) {
+    return { action: 'none', reason: 'healthy', pid: await getPid(), elapsed_ms: now() - startedAt };
+  }
+
+  let reason = partialStall || status.error || 'api_unavailable';
+  if (!partialStall && status.success && !status.api_available) {
+    while (now() < deadline) {
+      await resetConnection();
+      await wait(Math.min(500, Math.max(1, deadline - now())));
+      status = await check();
+      if (status.success && status.api_available && hasChartTarget(status)) {
+        if (await chartWorks()) {
+          return { action: 'none', reason: 'healthy', pid: await getPid(), elapsed_ms: now() - startedAt };
+        }
+        reason = partialStall;
+        break;
+      }
+      if (!status.success) {
+        reason = status.error || 'mcp_disconnected';
+        break;
+      }
+    }
+  }
+
+  await resetConnection();
+  const launched = await doLaunch({ kill_existing: !no_kill });
+  const readyDeadline = now() + timeoutMs;
+  let lastStatus = status;
+  let stableSymbol = null;
+  while (now() < readyDeadline) {
+    lastStatus = await check();
+    const chartTargetReady = hasChartTarget(lastStatus);
+    if (lastStatus.success && lastStatus.api_available && chartTargetReady) {
+      const remainingMs = readyDeadline - now();
+      if (remainingMs <= 0) break;
+      try {
+        const probe = await probeChart(remainingMs);
+        if (probe?.ready && probe.symbol) {
+          if (stableSymbol === probe.symbol) {
+            // Symbol round-trips prove the widget accepts commands; the data feed
+            // can still be empty for 10-30s after a cold launch. Readiness means
+            // the active series has bars, otherwise the first read after ensure fails.
+            const barsReady = await (_deps?.hasBars || hasBars)(Math.max(1, readyDeadline - now()));
+            if (!barsReady) {
+              await wait(Math.min(1000, Math.max(1, readyDeadline - now())));
+              continue;
+            }
+            return {
+              action: 'relaunched',
+              reason,
+              pid: launched?.pid ?? await getPid(),
+              elapsed_ms: now() - startedAt,
+            };
+          }
+          stableSymbol = probe.symbol;
+          await wait(Math.min(1000, Math.max(1, readyDeadline - now())));
+          continue;
+        }
+      } catch {
+        // The widget can expose its API before it accepts chart operations.
+      }
+    } else if (lastStatus.success && (!lastStatus.api_available || !chartTargetReady)) {
+      // Do not retain a live splash renderer or a chart renderer whose API has
+      // not initialized; the next check must resolve the target list again.
+      await resetConnection();
+    }
+    stableSymbol = null;
+    await wait(Math.min(500, Math.max(1, readyDeadline - now())));
+  }
+
+  const err = new Error(`TradingView chart API did not stabilise within ${timeoutMs}ms`);
+  err.code = 'api_unavailable';
+  err.action = 'relaunched';
+  err.reason = reason;
+  err.pid = launched?.pid ?? null;
+  err.elapsed_ms = now() - startedAt;
+  throw err;
 }
 
 export async function discover() {
@@ -214,7 +460,13 @@ export async function launch({ port, kill_existing } = {}) {
   if (killFirst) {
     try {
       if (platform === 'win32') execSync('taskkill /F /IM TradingView.exe', { timeout: 5000 });
-      else execSync('pkill -f TradingView', { timeout: 5000 });
+      // Match the main executable name only. A broad `pkill -f TradingView` also
+      // signals the ShipIt updater and can interrupt an in-progress installation.
+      else if (platform === 'darwin') execSync('pkill -x TradingView', { timeout: 5000 });
+      else {
+        try { execSync('pkill -x tradingview', { timeout: 5000 }); }
+        catch { execSync('pkill -x TradingView', { timeout: 5000 }); }
+      }
       await new Promise(r => setTimeout(r, 1500));
     } catch { /* may not be running */ }
   }

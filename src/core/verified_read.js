@@ -8,6 +8,19 @@ const DEFAULT_CONFIRM_ATTEMPTS = 10;
 const DEFAULT_CONFIRM_DELAY_MS = 150;
 const DEFAULT_READ_ATTEMPTS = 3;
 const DEFAULT_READ_RETRY_DELAY_MS = 500;
+const DEFAULT_SYMBOL_RETRY_DELAY_MS = 1000;
+// A freshly (re)launched chart answers the symbol confirm before its data feed
+// has delivered any bars. An EMPTY result is "still loading", not an implausible
+// price, so it gets a longer, bounded wait than a bad-price retry.
+const DEFAULT_EMPTY_READ_ATTEMPTS = Number(process.env.TV_EMPTY_READ_ATTEMPTS) > 0
+  ? Number(process.env.TV_EMPTY_READ_ATTEMPTS) : 8;
+const DEFAULT_EMPTY_READ_DELAY_MS = 1000;
+
+function isEmptyRead(read, result) {
+  if (read === 'quote') return result == null || (result.last == null && result.close == null);
+  const bars = result?.bars || result?.data?.bars;
+  return !Array.isArray(bars) || bars.length === 0;
+}
 const DEFAULT_PRICE_GUARD = '/Users/mb/Projects/STMS-AI-Trading-Desk/scripts/price-plausibility.mjs';
 
 function sleep(ms) {
@@ -29,6 +42,8 @@ function symbolsMatch(actual, expected) {
 }
 
 function errorCode(err, fallback) {
+  if (err?.code === 'renderer_unresponsive') return 'renderer_unresponsive';
+  if (err?.code === 'mcp_disconnected') return 'mcp_disconnected';
   const message = err?.message || String(err || '');
   if (/CDP|connection|ECONNREFUSED|not running|disconnected/i.test(message)) return 'mcp_disconnected';
   return fallback;
@@ -64,30 +79,51 @@ async function readWithPlausibility({
 }) {
   let lastResult = null;
   let lastPrice = NaN;
+  let maxAttempts = DEFAULT_READ_ATTEMPTS;
+  let emptyStreak = 0;
 
-  for (let attempt = 1; attempt <= DEFAULT_READ_ATTEMPTS; attempt++) {
-    if (attempt > 1) {
-      const setResult = await (deps?.setSymbol || chart.setSymbol)({ symbol });
-      if (setResult?.success === false) throw new Error(setResult.error || 'symbol set returned success:false');
-      if (timeframe) {
-        const tfResult = await (deps?.setTimeframe || chart.setTimeframe)({ timeframe });
-        if (tfResult?.success === false) throw new Error(tfResult.error || 'timeframe set returned success:false');
-      }
-      const confirmed = await confirmSymbol({
-        symbol,
-        attempts: confirmAttempts,
-        delayMs: confirmDelayMs,
-        deps,
-      });
-      if (!confirmed.matched) {
-        throw new Error(`active symbol ${confirmed.state?.symbol || 'unknown'} did not match ${symbol}`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1 && emptyStreak === 0) {
+      try {
+        const setResult = await (deps?.setSymbol || chart.setSymbol)({ symbol });
+        if (setResult?.success === false) throw new Error(setResult.error || 'symbol set returned success:false');
+        if (timeframe) {
+          const tfResult = await (deps?.setTimeframe || chart.setTimeframe)({ timeframe });
+          if (tfResult?.success === false) throw new Error(tfResult.error || 'timeframe set returned success:false');
+        }
+        const confirmed = await confirmSymbol({
+          symbol,
+          timeframe,
+          attempts: confirmAttempts,
+          delayMs: confirmDelayMs,
+          deps,
+        });
+        if (!confirmed.matched) {
+          throw new Error(`active symbol ${confirmed.state?.symbol || 'unknown'} did not match ${symbol}`);
+        }
+      } catch (err) {
+        err.read_attempts = attempt;
+        throw err;
       }
       await sleep(DEFAULT_READ_RETRY_DELAY_MS);
     }
 
-    const result = read === 'quote'
-      ? await (deps?.getQuote || data.getQuote)({})
-      : await (deps?.getOhlcv || data.getOhlcv)({ count: Number(count), summary: false });
+    let result;
+    try {
+      result = read === 'quote'
+        ? await (deps?.getQuote || data.getQuote)({})
+        : await (deps?.getOhlcv || data.getOhlcv)({ count: Number(count), summary: false });
+    } catch (err) {
+      // `getOhlcv` throws "may still be loading" on an empty series. That is the
+      // same state as an empty result — retry it on the bounded empty-read budget
+      // instead of failing the read on the first cold bar request.
+      if (read === 'ohlcv' && /still be loading|Could not extract OHLCV/i.test(err?.message || '')) {
+        result = { bars: [] };
+      } else {
+        err.read_attempts = attempt;
+        throw err;
+      }
+    }
     const price = getReadPrice(read, result);
     lastResult = result;
     lastPrice = price;
@@ -96,12 +132,21 @@ async function readWithPlausibility({
       return { result, price, attempts: attempt };
     }
 
-    if (attempt < DEFAULT_READ_ATTEMPTS) {
+    if (isEmptyRead(read, result)) {
+      // Data feed not delivered yet: keep the confirmed symbol, wait longer, bounded.
+      emptyStreak += 1;
+      maxAttempts = Math.max(maxAttempts, Math.min(attempt + 1, DEFAULT_EMPTY_READ_ATTEMPTS));
+      if (attempt < maxAttempts) await sleep(deps?.emptyReadDelayMs ?? DEFAULT_EMPTY_READ_DELAY_MS);
+      continue;
+    }
+    emptyStreak = 0;
+
+    if (attempt < maxAttempts) {
       await sleep(DEFAULT_READ_RETRY_DELAY_MS);
     }
   }
 
-  return { result: lastResult, price: lastPrice, attempts: DEFAULT_READ_ATTEMPTS };
+  return { result: lastResult, price: lastPrice, attempts: maxAttempts };
 }
 
 async function restoreChart(original, deps) {
@@ -119,19 +164,39 @@ async function restoreChart(original, deps) {
     return {
       restored: false,
       restored_to: { symbol: original.symbol, timeframe: original.resolution },
+      restore_error_code: errorCode(err, 'restore_failed'),
       restore_error: err.message || String(err),
     };
   }
 }
 
-async function confirmSymbol({ symbol, attempts, delayMs, deps }) {
+async function confirmSymbol({ symbol, timeframe, attempts, delayMs, deps }) {
   let lastState = null;
+  const wait = deps?.sleep || sleep;
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    lastState = await (deps?.getState || chart.getState)();
+    try {
+      lastState = await (deps?.getState || chart.getState)();
+    } catch (err) {
+      err.confirm_attempts = attempt;
+      throw err;
+    }
     if (symbolsMatch(lastState?.symbol, symbol)) {
       return { matched: true, state: lastState, attempts: attempt };
     }
-    await sleep(delayMs);
+    if (attempt < attempts) {
+      await wait(Math.max(delayMs, DEFAULT_SYMBOL_RETRY_DELAY_MS));
+      try {
+        const setResult = await (deps?.setSymbol || chart.setSymbol)({ symbol });
+        if (setResult?.success === false) throw new Error(setResult.error || 'symbol set returned success:false');
+        if (timeframe) {
+          const tfResult = await (deps?.setTimeframe || chart.setTimeframe)({ timeframe });
+          if (tfResult?.success === false) throw new Error(tfResult.error || 'timeframe set returned success:false');
+        }
+      } catch (err) {
+        err.confirm_attempts = attempt;
+        throw err;
+      }
+    }
   }
   return { matched: false, state: lastState, attempts };
 }
@@ -176,16 +241,29 @@ export async function verifiedRead({
         if (tfResult?.success === false) throw new Error(tfResult.error || 'timeframe set returned success:false');
       }
     } catch (err) {
-      response = { success: false, error: 'set_failed', message: err.message || String(err), symbol, restored: false };
+      response = { success: false, error: errorCode(err, 'set_failed'), message: err.message || String(err), symbol, restored: false };
       return response;
     }
 
-    confirmed = await confirmSymbol({
-      symbol,
-      attempts: Number(confirm_attempts) || DEFAULT_CONFIRM_ATTEMPTS,
-      delayMs: Number(confirm_delay_ms) || DEFAULT_CONFIRM_DELAY_MS,
-      deps: _deps,
-    });
+    try {
+      confirmed = await confirmSymbol({
+        symbol,
+        timeframe,
+        attempts: Number(confirm_attempts) || DEFAULT_CONFIRM_ATTEMPTS,
+        delayMs: Number(confirm_delay_ms) || DEFAULT_CONFIRM_DELAY_MS,
+        deps: _deps,
+      });
+    } catch (err) {
+      response = {
+        success: false,
+        error: errorCode(err, 'symbol_confirm_failed'),
+        message: err.message || String(err),
+        symbol,
+        confirm_attempts: err.confirm_attempts || 1,
+        restored: false,
+      };
+      return response;
+    }
     if (!confirmed.matched) {
       response = {
         success: false,
@@ -219,11 +297,12 @@ export async function verifiedRead({
     } catch (err) {
       response = {
         success: false,
-        error: 'read_failed',
+        error: errorCode(err, 'read_failed'),
         message: err.message || String(err),
         symbol,
         confirmed_symbol: confirmed.state?.symbol || '',
         confirm_attempts: confirmed.attempts,
+        read_attempts: err.read_attempts || 1,
         restored: false,
       };
       return response;
