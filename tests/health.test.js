@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { ensure, healthCheck } from '../src/core/health.js';
+import { ensure, healthCheck, probeCdpVersion } from '../src/core/health.js';
+import net from 'node:net';
 
 function fakeDeps(statuses, roundTrips = [{ ready: true, symbol: 'OANDA:AUDJPY' }]) {
   const queue = [...statuses];
@@ -185,5 +186,34 @@ describe('healthCheck target classification', () => {
     assert.equal(result.target_is_chart, false);
     assert.equal(result.api_available, false);
     assert.equal(evaluated, false);
+  });
+});
+
+describe('probeCdpVersion', () => {
+  it('returns null within the deadline when the port accepts but never answers', async () => {
+    // A TCP listener that accepts connections and stays silent — the shape of a
+    // stalled Electron network service or an app mid-shutdown.
+    const sockets = new Set();
+    const server = net.createServer((socket) => { sockets.add(socket); /* accept and never respond */ });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const startedAt = Date.now();
+    try {
+      const result = await probeCdpVersion(port, 300);
+      assert.equal(result, null);
+      assert.ok(Date.now() - startedAt < 2000, 'probe must give up at its deadline, not hang');
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+
+  it('returns null immediately when nothing listens on the port', async () => {
+    const server = net.createServer();
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    await new Promise(resolve => server.close(resolve));
+    const result = await probeCdpVersion(port, 300);
+    assert.equal(result, null);
   });
 });

@@ -178,6 +178,28 @@ function mainProcessPid() {
   }
 }
 
+/**
+ * GET /json/version with a hard deadline. A port that accepts the TCP connection
+ * but never answers (Electron mid-shutdown, stalled network service) must not
+ * hang the launcher before the readiness deadline even starts.
+ */
+export async function probeCdpVersion(cdpPort, timeoutMs = Number(process.env.TV_CDP_PROBE_TIMEOUT_MS) > 0
+  ? Number(process.env.TV_CDP_PROBE_TIMEOUT_MS) : 3000) {
+  const http = await import('http');
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
+    const req = http.get(`http://localhost:${cdpPort}/json/version`, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => finish(data));
+      res.on('error', () => finish(null));
+    });
+    const timer = setTimeout(() => { req.destroy(new Error('cdp_probe_timeout')); finish(null); }, timeoutMs);
+    req.on('error', () => finish(null));
+  });
+}
+
 /** Ensure a responsive chart renderer, relaunching TradingView only when required. */
 export async function ensure({ timeout = 30, no_kill = false, _deps } = {}) {
   const startedAt = (_deps?.now || Date.now)();
@@ -477,14 +499,7 @@ export async function launch({ port, kill_existing } = {}) {
   for (let i = 0; i < 15; i++) {
     await new Promise(r => setTimeout(r, 1000));
     try {
-      const http = await import('http');
-      const ready = await new Promise((resolve) => {
-        http.get(`http://localhost:${cdpPort}/json/version`, (res) => {
-          let data = '';
-          res.on('data', (chunk) => data += chunk);
-          res.on('end', () => resolve(data));
-        }).on('error', () => resolve(null));
-      });
+      const ready = await probeCdpVersion(cdpPort);
       if (ready) {
         const info = JSON.parse(ready);
         return {
