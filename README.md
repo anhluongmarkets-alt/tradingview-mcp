@@ -108,7 +108,7 @@ scripts\launch_tv_debug.bat
 
 **Or launch manually on any platform:**
 ```bash
-/path/to/TradingView --remote-debugging-port=9222
+/path/to/TradingView --remote-debugging-port=9222 --disable-renderer-backgrounding --disable-background-timer-throttling --disable-backgrounding-occluded-windows
 ```
 
 **Or use the MCP tool** (auto-detects your install):
@@ -351,7 +351,7 @@ Launch scripts and `tv_launch` auto-detect TradingView. If auto-detection fails:
 | **Windows** | `%LOCALAPPDATA%\TradingView\TradingView.exe`, `%PROGRAMFILES%\WindowsApps\TradingView*\TradingView.exe` |
 | **Linux** | `/opt/TradingView/tradingview`, `~/.local/share/TradingView/TradingView`, `/snap/tradingview/current/tradingview` |
 
-The key flag: `--remote-debugging-port=9222`
+The key flag: `--remote-debugging-port=9222`. The launchers also pass `--disable-renderer-backgrounding --disable-background-timer-throttling --disable-backgrounding-occluded-windows` so a hidden or occluded window is not throttled.
 
 ## Testing
 
