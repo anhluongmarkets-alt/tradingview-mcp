@@ -49,7 +49,10 @@ sleep 1
 
 echo "Found TradingView at: $APP"
 echo "Launching with --remote-debugging-port=$PORT ..."
-"$APP" --remote-debugging-port=$PORT &
+"$APP" --remote-debugging-port=$PORT \
+  --disable-renderer-backgrounding \
+  --disable-background-timer-throttling \
+  --disable-backgrounding-occluded-windows &
 TV_PID=$!
 echo "PID: $TV_PID"
 
