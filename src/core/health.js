@@ -427,6 +427,21 @@ export async function uiState() {
   return { success: true, ...state };
 }
 
+
+// Chromium switches that stop a hidden / occluded TradingView window from being
+// throttled. Without them a hidden chart drifts from ~0.5s to 10-30s per CDP
+// call and unattended pulls hit the 30s CDP deadline (A/B 2026-10-10: hidden
+// window FAIL after 1065s vs 387s OK with identical bars when these are set).
+export const ANTI_THROTTLE_FLAGS = [
+  '--disable-renderer-backgrounding',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+];
+
+export function tvLaunchArgs(cdpPort) {
+  return [`--remote-debugging-port=${cdpPort}`, ...ANTI_THROTTLE_FLAGS];
+}
+
 export async function launch({ port, kill_existing } = {}) {
   const cdpPort = port || 9222;
   const killFirst = kill_existing !== false;
@@ -493,7 +508,7 @@ export async function launch({ port, kill_existing } = {}) {
     } catch { /* may not be running */ }
   }
 
-  const child = spawn(tvPath, [`--remote-debugging-port=${cdpPort}`], { detached: true, stdio: 'ignore' });
+  const child = spawn(tvPath, tvLaunchArgs(cdpPort), { detached: true, stdio: 'ignore' });
   child.unref();
 
   for (let i = 0; i < 15; i++) {

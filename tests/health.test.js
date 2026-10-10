@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { ensure, healthCheck, probeCdpVersion } from '../src/core/health.js';
+import { ensure, healthCheck, probeCdpVersion, tvLaunchArgs } from '../src/core/health.js';
 import net from 'node:net';
 
 function fakeDeps(statuses, roundTrips = [{ ready: true, symbol: 'OANDA:AUDJPY' }]) {
@@ -215,5 +215,16 @@ describe('probeCdpVersion', () => {
     await new Promise(resolve => server.close(resolve));
     const result = await probeCdpVersion(port, 300);
     assert.equal(result, null);
+  });
+});
+
+describe('tvLaunchArgs', () => {
+  it('opens the CDP port and disables background throttling', () => {
+    assert.deepEqual(tvLaunchArgs(9222), [
+      '--remote-debugging-port=9222',
+      '--disable-renderer-backgrounding',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+    ]);
   });
 });

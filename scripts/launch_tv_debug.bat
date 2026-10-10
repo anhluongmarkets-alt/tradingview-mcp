@@ -36,7 +36,7 @@ if "%TV_EXE%"=="" (
 
 echo Found TradingView at: %TV_EXE%
 echo Starting with --remote-debugging-port=%PORT%...
-start "" "%TV_EXE%" --remote-debugging-port=%PORT%
+start "" "%TV_EXE%" --remote-debugging-port=%PORT% --disable-renderer-backgrounding --disable-background-timer-throttling --disable-backgrounding-occluded-windows
 
 echo Waiting for CDP to become available...
 timeout /t 5 /nobreak >nul
