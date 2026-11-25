@@ -2,6 +2,7 @@
  * Verified TradingView reads: set chart -> confirm active symbol -> read -> sanity-check -> restore.
  */
 import * as chart from './chart.js';
+import { dismissPromoDialogs } from './promo.js';
 import * as data from './data.js';
 
 const DEFAULT_CONFIRM_ATTEMPTS = 10;
@@ -219,6 +220,9 @@ export async function verifiedRead({
   if (read === 'ohlcv' && !Number.isFinite(Number(count))) {
     return { success: false, error: 'read_failed', message: 'count is required for ohlcv reads', symbol, restored: false };
   }
+
+  // Close a promotional pop-up first: it covers the chart and the read comes back implausible.
+  await (_deps?.dismissPromo || (_deps ? async () => null : dismissPromoDialogs))();
 
   let original = null;
   let confirmed = null;
