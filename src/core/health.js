@@ -2,6 +2,7 @@
  * Core health/discovery/launch logic.
  */
 import { getClient, getTargetInfo, evaluate, disconnect, isChartTarget, getCdpTimeoutMs, KNOWN_PATHS } from '../connection.js';
+import { dismissPromoDialogs } from './promo.js';
 import { existsSync } from 'fs';
 import * as data from './data.js';
 import { execSync, spawn } from 'child_process';
@@ -212,6 +213,9 @@ export async function ensure({ timeout = 30, no_kill = false, _deps } = {}) {
   const getPid = _deps?.getPid || mainProcessPid;
   const probeChart = _deps?.chartRoundTrip || chartRoundTrip;
   const resetConnection = _deps?.disconnect || disconnect;
+  // A promotional pop-up over the chart breaks the next read: close it once the chart answers.
+  // Injected deps without dismissPromo (unit tests) skip it: no CDP outside a live chart.
+  const dismissPromo = () => (_deps?.dismissPromo || (_deps ? async () => null : dismissPromoDialogs))();
 
   // A quick `Runtime.evaluate` answering is not proof the chart can do work: a
   // partially stalled renderer (the 2026-09-17 10:20 shape) still answers the
@@ -232,7 +236,7 @@ export async function ensure({ timeout = 30, no_kill = false, _deps } = {}) {
 
   let status = await check();
   if (status.success && status.api_available && hasChartTarget(status) && await chartWorks()) {
-    return { action: 'none', reason: 'healthy', pid: await getPid(), elapsed_ms: now() - startedAt };
+    return { action: 'none', reason: 'healthy', pid: await getPid(), elapsed_ms: now() - startedAt, promo: await dismissPromo() };
   }
 
   let reason = partialStall || status.error || 'api_unavailable';
@@ -243,7 +247,7 @@ export async function ensure({ timeout = 30, no_kill = false, _deps } = {}) {
       status = await check();
       if (status.success && status.api_available && hasChartTarget(status)) {
         if (await chartWorks()) {
-          return { action: 'none', reason: 'healthy', pid: await getPid(), elapsed_ms: now() - startedAt };
+          return { action: 'none', reason: 'healthy', pid: await getPid(), elapsed_ms: now() - startedAt, promo: await dismissPromo() };
         }
         reason = partialStall;
         break;
@@ -280,6 +284,7 @@ export async function ensure({ timeout = 30, no_kill = false, _deps } = {}) {
             }
             return {
               action: 'relaunched',
+              promo: await dismissPromo(),
               reason,
               pid: launched?.pid ?? await getPid(),
               elapsed_ms: now() - startedAt,
