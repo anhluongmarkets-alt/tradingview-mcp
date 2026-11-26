@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { isPromoDialog, pickCloseButton, dismissPromoDialogs } from '../src/core/promo.js';
+import { isPromoDialog, pickCloseButton, dismissPromoDialogs, reactCloseExpr } from '../src/core/promo.js';
 
 describe('promo dialog detection', () => {
   it('flags plan-sale adverts', () => {
@@ -52,6 +52,38 @@ describe('dismissPromoDialogs', () => {
     const r = await dismissPromoDialogs({ _deps: { evaluate: p.evaluate, sleep: async () => {}, getClient: async () => ({ Input: { dispatchKeyEvent: async e => keys.push(e.type) } }) } });
     assert.equal(r.escape, true);
     assert.deepEqual(keys, ['keyDown', 'keyUp']);
+  });
+  // A full-screen advert with no close control that also ignores Escape (STMS 2026-11-26 "gopro" dialog).
+  const stubborn = ({ closesOnReact }) => {
+    const calls = []; let open = true;
+    const evaluate = async expr => {
+      calls.push(expr);
+      if (expr.startsWith('(() => {\n  const vis')) return [{ i: 0, text: 'Analyze markets in TradingView Desktop Upgrade your plan Explore Black Friday offers', buttons: [{ text: '', label: 'Pause', hasIcon: true, cornerTop: 300, cornerRight: 400 }, { text: 'Explore Black Friday offers' }] }];
+      if (expr.includes("querySelectorAll('[data-stms-dlg]')")) return open ? [0] : [];
+      if (expr.includes('__reactFiber')) { if (closesOnReact) open = false; return true; }
+      return true;
+    };
+    return { calls, evaluate };
+  };
+  const client = async () => ({ Input: { dispatchKeyEvent: async () => {} } });
+  it('calls the dialog onClose when Escape leaves it open, and verifies it closed', async () => {
+    const p = stubborn({ closesOnReact: true });
+    const r = await dismissPromoDialogs({ _deps: { evaluate: p.evaluate, sleep: async () => {}, getClient: client } });
+    assert.equal(r.escape, true);
+    assert.deepEqual(r.dismissed.map(d => [d.method, d.first_try]), [['react_onclose', 'escape']]);
+    assert.deepEqual(r.still_open, []);
+    assert.ok(p.calls.some(c => c.includes('__reactFiber') && c.includes('data-stms-dlg="0"')));
+    assert.ok(!p.calls.some(c => c.includes('data-stms-btn="0-1"')), 'offer button never clicked');
+  });
+  it('reports a dialog that survives every attempt as still open, not dismissed', async () => {
+    const p = stubborn({ closesOnReact: false });
+    const r = await dismissPromoDialogs({ _deps: { evaluate: p.evaluate, sleep: async () => {}, getClient: client } });
+    assert.deepEqual(r.dismissed, []);
+    assert.equal(r.still_open.length, 1);
+    assert.match(r.still_open[0], /Black Friday/);
+  });
+  it('builds a react-close script only for a numeric dialog index', () => {
+    assert.ok(reactCloseExpr('0"]);alert(1);//').includes('data-stms-dlg="NaN"'));
   });
   it('never throws when the page is gone', async () => {
     const r = await dismissPromoDialogs({ _deps: { evaluate: async () => { throw Object.assign(new Error('x'), { code: 'mcp_disconnected' }); } } });
